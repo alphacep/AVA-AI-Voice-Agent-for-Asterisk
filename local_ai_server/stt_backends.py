@@ -769,3 +769,126 @@ class WhisperCppSTTBackend:
         self._initialized = False
         self._audio_buffer = np.array([], dtype=np.float32)
         logging.info("🛑 WHISPER.CPP - Model shutdown")
+
+
+class ToneSTTBackend:
+    """
+    T-One STT backend (71M Conformer, streaming CTC, telephony-optimized).
+
+    Uses the ``tone`` package for Russian-language speech recognition.
+    """
+
+    def __init__(self, model_path: str = "", language: str = "ru"):
+        self.model_path = model_path
+        self.language = language
+        self.pipeline = None
+        self._initialized = False
+
+    def initialize(self) -> bool:
+        try:
+            from tone import StreamingCTCPipeline
+
+            logging.info(
+                "🎤 T-ONE - Loading model (path=%s)",
+                self.model_path or "HuggingFace default",
+            )
+
+            if self.model_path:
+                self.pipeline = StreamingCTCPipeline.from_pretrained(self.model_path)
+            else:
+                self.pipeline = StreamingCTCPipeline.from_hugging_face()
+
+            self._initialized = True
+            logging.info("✅ T-ONE - Model loaded successfully")
+            return True
+
+        except ImportError:
+            logging.error("❌ T-ONE - tone package not installed")
+            return False
+        except Exception as exc:
+            logging.error("❌ T-ONE - Failed to initialize: %s", exc)
+            return False
+
+    def transcribe_pcm16(self, pcm16_audio: bytes) -> str:
+        if not self._initialized or self.pipeline is None:
+            return ""
+        if not pcm16_audio:
+            return ""
+        try:
+            samples = np.frombuffer(pcm16_audio, dtype=np.int16)
+            float_samples = samples.astype(np.float32) / 32768.0
+            result = self.pipeline.forward_offline(float_samples)
+            return (result or "").strip()
+        except Exception:
+            logging.error("❌ T-ONE - transcribe_pcm16 failed", exc_info=True)
+            return ""
+
+    def shutdown(self) -> None:
+        self.pipeline = None
+        self._initialized = False
+        logging.info("🛑 T-ONE - Model shutdown")
+
+
+class GigaamSTTBackend:
+    """
+    GigaAM v3 STT backend (220M Conformer, batch, with punctuation/normalization).
+
+    Uses the ``gigaam`` package for Russian-language speech recognition.
+    """
+
+    def __init__(self, model_name: str = "v3_e2e_rnnt", device: str = "cpu"):
+        self.model_name = model_name
+        self.device = device
+        self.model = None
+        self._initialized = False
+
+    def initialize(self) -> bool:
+        try:
+            import gigaam
+
+            logging.info(
+                "🎤 GIGAAM - Loading model=%s device=%s",
+                self.model_name,
+                self.device,
+            )
+
+            self.model = gigaam.load_model(self.model_name, device=self.device)
+
+            self._initialized = True
+            logging.info("✅ GIGAAM - Model loaded successfully")
+            return True
+
+        except ImportError:
+            logging.error("❌ GIGAAM - gigaam package not installed")
+            return False
+        except Exception as exc:
+            logging.error("❌ GIGAAM - Failed to initialize: %s", exc)
+            return False
+
+    def transcribe_pcm16(self, pcm16_audio: bytes) -> str:
+        if not self._initialized or self.model is None:
+            return ""
+        if not pcm16_audio:
+            return ""
+        try:
+            import torch
+
+            samples = np.frombuffer(pcm16_audio, dtype=np.int16)
+            float_samples = samples.astype(np.float32) / 32768.0
+
+            # Energy-based VAD: skip if too quiet
+            energy = float(np.sqrt(np.mean(float_samples ** 2)))
+            if energy < 0.02:
+                return ""
+
+            tensor = torch.from_numpy(float_samples).unsqueeze(0)
+            result = self.model.transcribe(tensor)
+            return (result or "").strip()
+        except Exception:
+            logging.error("❌ GIGAAM - transcribe_pcm16 failed", exc_info=True)
+            return ""
+
+    def shutdown(self) -> None:
+        self.model = None
+        self._initialized = False
+        logging.info("🛑 GIGAAM - Model shutdown")

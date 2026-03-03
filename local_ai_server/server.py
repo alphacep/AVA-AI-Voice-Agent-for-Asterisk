@@ -732,7 +732,7 @@ class _LegacyAudioProcessor:
 
 
 # Backends and audio processor are maintained in separate modules for easier development.
-from stt_backends import KrokoSTTBackend, SherpaONNXSTTBackend
+from stt_backends import KrokoSTTBackend, SherpaONNXSTTBackend, ToneSTTBackend, GigaamSTTBackend
 from tts_backends import KokoroTTSBackend
 from audio_processor import AudioProcessor
 
@@ -752,6 +752,10 @@ class LocalAIServer:
         self._faster_whisper_lock = asyncio.Lock()
         # Lock to serialize Whisper.cpp inference (avoid concurrent model access).
         self._whisper_cpp_lock = asyncio.Lock()
+        # Lock to serialize T-One inference.
+        self._tone_lock = asyncio.Lock()
+        # Lock to serialize GigaAM inference.
+        self._gigaam_lock = asyncio.Lock()
         # Component -> last startup error (used for degraded mode status/logging)
         self.startup_errors: Dict[str, str] = {}
         # Track runtime fallbacks (e.g. CUDA -> CPU) for operator visibility.
@@ -774,6 +778,8 @@ class LocalAIServer:
         self.sherpa_backend: Optional[SherpaONNXSTTBackend] = None
         self.faster_whisper_backend: Optional["FasterWhisperSTTBackend"] = None
         self.whisper_cpp_backend: Optional["WhisperCppSTTBackend"] = None
+        self.tone_backend: Optional[ToneSTTBackend] = None
+        self.gigaam_backend: Optional[GigaamSTTBackend] = None
         self.kokoro_backend: Optional[KokoroTTSBackend] = None
         self.melotts_backend: Optional["MeloTTSBackend"] = None
         self._apply_config(self.config)
@@ -1015,6 +1021,9 @@ class LocalAIServer:
         self.faster_whisper_language = config.faster_whisper_language
         self.whisper_cpp_model_path = config.whisper_cpp_model_path
         self.whisper_cpp_language = config.whisper_cpp_language
+        self.tone_model_path = config.tone_model_path
+        self.gigaam_model_name = config.gigaam_model_name
+        self.gigaam_device = config.gigaam_device
         self.kroko_url = config.kroko_url
         self.kroko_api_key = config.kroko_api_key
         self.kroko_language = config.kroko_language
@@ -1119,7 +1128,7 @@ class LocalAIServer:
             logging.info("✅ All models loaded successfully for MVP pipeline")
 
     async def _load_stt_model(self):
-        """Load STT model based on configured backend (vosk, kroko, sherpa, faster_whisper, or whisper_cpp)."""
+        """Load STT model based on configured backend (vosk, kroko, sherpa, faster_whisper, whisper_cpp, tone, or gigaam)."""
         if self.stt_backend == "kroko":
             await self._load_kroko_backend()
         elif self.stt_backend == "sherpa":
@@ -1128,6 +1137,10 @@ class LocalAIServer:
             await self._load_faster_whisper_backend()
         elif self.stt_backend == "whisper_cpp":
             await self._load_whisper_cpp_backend()
+        elif self.stt_backend == "tone":
+            await self._load_tone_backend()
+        elif self.stt_backend == "gigaam":
+            await self._load_gigaam_backend()
         else:
             await self._load_vosk_backend()
 
@@ -1354,6 +1367,56 @@ class LocalAIServer:
         except Exception as exc:
             logging.error("❌ Failed to initialize Whisper.cpp STT backend: %s", exc)
             self.whisper_cpp_backend = None
+            self.startup_errors["stt"] = str(exc)
+            if self.fail_fast:
+                raise
+
+    async def _load_tone_backend(self):
+        """Initialize T-One STT backend (71M Conformer, Russian telephony)."""
+        try:
+            logging.info(
+                "🎤 STT backend: T-One (model_path=%s)",
+                self.tone_model_path or "HuggingFace default",
+            )
+
+            self.tone_backend = ToneSTTBackend(
+                model_path=self.tone_model_path,
+            )
+
+            if not self.tone_backend.initialize():
+                raise RuntimeError("Failed to initialize T-One")
+
+            logging.info("✅ STT backend: T-One initialized")
+
+        except Exception as exc:
+            logging.error("❌ Failed to initialize T-One STT backend: %s", exc)
+            self.tone_backend = None
+            self.startup_errors["stt"] = str(exc)
+            if self.fail_fast:
+                raise
+
+    async def _load_gigaam_backend(self):
+        """Initialize GigaAM v3 STT backend (220M Conformer, Russian)."""
+        try:
+            logging.info(
+                "🎤 STT backend: GigaAM (model=%s, device=%s)",
+                self.gigaam_model_name,
+                self.gigaam_device,
+            )
+
+            self.gigaam_backend = GigaamSTTBackend(
+                model_name=self.gigaam_model_name,
+                device=self.gigaam_device,
+            )
+
+            if not self.gigaam_backend.initialize():
+                raise RuntimeError("Failed to initialize GigaAM")
+
+            logging.info("✅ STT backend: GigaAM initialized")
+
+        except Exception as exc:
+            logging.error("❌ Failed to initialize GigaAM STT backend: %s", exc)
+            self.gigaam_backend = None
             self.startup_errors["stt"] = str(exc)
             if self.fail_fast:
                 raise
@@ -2926,6 +2989,10 @@ class LocalAIServer:
             return self.faster_whisper_backend is not None
         if self.stt_backend == "whisper_cpp":
             return self.whisper_cpp_backend is not None
+        if self.stt_backend == "tone":
+            return self.tone_backend is not None
+        if self.stt_backend == "gigaam":
+            return self.gigaam_backend is not None
         # Default: Vosk
         return self.stt_model is not None and KaldiRecognizer is not None
 
@@ -2945,6 +3012,12 @@ class LocalAIServer:
             return await self._process_stt_stream_faster_whisper(session, audio_data, input_rate)
         elif self.stt_backend == "whisper_cpp":
             return await self._process_stt_stream_whisper_cpp(session, audio_data, input_rate)
+        elif self.stt_backend == "tone":
+            return await self._process_stt_stream_whisper_segmented(
+                session, audio_data, input_rate, backend_name="tone")
+        elif self.stt_backend == "gigaam":
+            return await self._process_stt_stream_whisper_segmented(
+                session, audio_data, input_rate, backend_name="gigaam")
         else:
             return await self._process_stt_stream_vosk(session, audio_data, input_rate)
 
@@ -2997,6 +3070,12 @@ class LocalAIServer:
         elif backend_name == "whisper_cpp":
             backend = self.whisper_cpp_backend
             lock = self._whisper_cpp_lock
+        elif backend_name == "tone":
+            backend = self.tone_backend
+            lock = self._tone_lock
+        elif backend_name == "gigaam":
+            backend = self.gigaam_backend
+            lock = self._gigaam_lock
         else:  # pragma: no cover - defensive guard
             logging.error("Unknown Whisper backend: %s", backend_name)
             return []
@@ -4089,7 +4168,7 @@ class LocalAIServer:
             await self._send_bytes(websocket, audio_bytes)
 
     def _arm_whisper_stt_suppression(self, session: SessionContext, audio_bytes: Optional[bytes], *, source: str) -> None:
-        if self.stt_backend not in {"faster_whisper", "whisper_cpp"}:
+        if self.stt_backend not in {"faster_whisper", "whisper_cpp", "tone", "gigaam"}:
             return
         if not audio_bytes:
             return
@@ -4112,7 +4191,7 @@ class LocalAIServer:
         )
 
     def _clear_whisper_stt_suppression(self, session: SessionContext, *, reason: str) -> None:
-        if self.stt_backend not in {"faster_whisper", "whisper_cpp"}:
+        if self.stt_backend not in {"faster_whisper", "whisper_cpp", "tone", "gigaam"}:
             return
         current_until = float(getattr(session, "stt_suppress_until", 0.0) or 0.0)
         if current_until <= monotonic():
@@ -4528,7 +4607,7 @@ class LocalAIServer:
 
         stt_modes = {"stt", "llm", "full"}
         if mode in stt_modes:
-            if self.stt_backend in {"faster_whisper", "whisper_cpp"} and monotonic() < (session.stt_suppress_until or 0.0):
+            if self.stt_backend in {"faster_whisper", "whisper_cpp", "tone", "gigaam"} and monotonic() < (session.stt_suppress_until or 0.0):
                 if DEBUG_AUDIO_FLOW:
                     remaining = max(0.0, float(session.stt_suppress_until - monotonic()))
                     logging.debug(

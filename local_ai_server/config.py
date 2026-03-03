@@ -38,6 +38,10 @@ class LocalAIConfig:
     whisper_cpp_model_path: str = "/app/models/stt/ggml-base.en.bin"
     whisper_cpp_language: str = "en"
 
+    tone_model_path: str = ""
+    gigaam_model_name: str = "v3_e2e_rnnt"
+    gigaam_device: str = "cpu"
+
     kroko_url: str = "wss://app.kroko.ai/api/v1/transcripts/streaming"
     kroko_api_key: str = ""
     kroko_language: str = "en-US"
@@ -165,6 +169,9 @@ class LocalAIConfig:
             faster_whisper_language=os.getenv("FASTER_WHISPER_LANGUAGE", "en"),
             whisper_cpp_model_path=whisper_cpp_model_path,
             whisper_cpp_language=os.getenv("WHISPER_CPP_LANGUAGE", "en"),
+            tone_model_path=os.getenv("TONE_MODEL_PATH", ""),
+            gigaam_model_name=os.getenv("GIGAAM_MODEL_NAME", "v3_e2e_rnnt"),
+            gigaam_device=os.getenv("GIGAAM_DEVICE", "cpu"),
             kroko_url=os.getenv(
                 "KROKO_URL",
                 "wss://app.kroko.ai/api/v1/transcripts/streaming",
